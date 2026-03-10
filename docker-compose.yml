@@ -1,0 +1,404 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GlobalRoute Pay — Local Development Stack
+#
+# Bring everything up:   docker compose up --build
+# Health check all:      ./scripts/healthcheck.sh
+# Tear down + volumes:   docker compose down -v
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks:
+    - globalroute
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    container_name: grp-postgres
+    environment:
+      POSTGRES_USER: grp
+      POSTGRES_PASSWORD: grp_secret
+      POSTGRES_DB: globalroute  # each service uses its own schema within this DB
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grp -d globalroute"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    <<: *service-defaults
+    image: redis:7-alpine
+    container_name: grp-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  zookeeper:
+    <<: *service-defaults
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: grp-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    <<: *service-defaults
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: grp-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"       # external (host) access
+      - "29092:29092"     # internal (container-to-container) access
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+
+  # Kafka UI — browse topics at http://localhost:8090
+  kafka-ui:
+    <<: *service-defaults
+    image: provectuslabs/kafka-ui:latest
+    container_name: grp-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: localdev
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # ── Core Services ───────────────────────────────────────────────────────────
+
+  api-gateway:
+    <<: *service-defaults
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: grp-api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      KAFKA_BROKERS: kafka:29092
+      REDIS_ADDR: redis:6379
+      JWT_SECRET: changeme_in_prod
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  routing-engine:
+    <<: *service-defaults
+    build:
+      context: ./services/routing-engine
+      dockerfile: Dockerfile
+    container_name: grp-routing-engine
+    ports:
+      - "8081:8081"
+    environment:
+      PORT: "8081"
+      KAFKA_BROKERS: kafka:29092
+      REDIS_ADDR: redis:6379
+      DB_DSN: postgres://grp:grp_secret@postgres:5432/globalroute?sslmode=disable
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  fraud-detection:
+    <<: *service-defaults
+    build:
+      context: ./services/fraud-detection
+      dockerfile: Dockerfile
+    container_name: grp-fraud-detection
+    ports:
+      - "8082:8082"
+    environment:
+      PORT: "8082"
+      KAFKA_BROKERS: kafka:29092
+      DB_DSN: postgres://grp:grp_secret@postgres:5432/globalroute?sslmode=disable
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  compliance:
+    <<: *service-defaults
+    build:
+      context: ./services/compliance
+      dockerfile: Dockerfile
+    container_name: grp-compliance
+    ports:
+      - "8083:8083"
+    environment:
+      PORT: "8083"
+      KAFKA_BROKERS: kafka:29092
+      DB_DSN: postgres://grp:grp_secret@postgres:5432/globalroute?sslmode=disable
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  fx-rate:
+    <<: *service-defaults
+    build:
+      context: ./services/fx-rate
+      dockerfile: Dockerfile
+    container_name: grp-fx-rate
+    ports:
+      - "8084:8084"
+    environment:
+      PORT: "8084"
+      KAFKA_BROKERS: kafka:29092
+      REDIS_ADDR: redis:6379
+      FX_PUBLISH_INTERVAL_SEC: "10"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8084/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  transaction-ledger:
+    <<: *service-defaults
+    build:
+      context: ./services/transaction-ledger
+      dockerfile: Dockerfile
+    container_name: grp-transaction-ledger
+    ports:
+      - "8085:8085"
+    environment:
+      PORT: "8085"
+      KAFKA_BROKERS: kafka:29092
+      DB_DSN: postgres://grp:grp_secret@postgres:5432/globalroute?sslmode=disable
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8085/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  notification:
+    <<: *service-defaults
+    build:
+      context: ./services/notification
+      dockerfile: Dockerfile
+    container_name: grp-notification
+    ports:
+      - "8086:8086"
+    environment:
+      PORT: "8086"
+      KAFKA_BROKERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8086/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Rail Adapters ───────────────────────────────────────────────────────────
+
+  rail-adapter-visa:
+    <<: *service-defaults
+    build:
+      context: ./services/rail-adapters/visa
+      dockerfile: Dockerfile
+    container_name: grp-rail-visa
+    ports:
+      - "8091:8091"
+    environment:
+      PORT: "8091"
+      KAFKA_BROKERS: kafka:29092
+      RAIL_NAME: visa
+      SIMULATED_FAILURE_RATE: "0.02"   # 2% failure simulation
+      SIMULATED_LATENCY_MS: "120"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8091/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rail-adapter-swift:
+    <<: *service-defaults
+    build:
+      context: ./services/rail-adapters/swift
+      dockerfile: Dockerfile
+    container_name: grp-rail-swift
+    ports:
+      - "8092:8092"
+    environment:
+      PORT: "8092"
+      KAFKA_BROKERS: kafka:29092
+      RAIL_NAME: swift
+      SIMULATED_FAILURE_RATE: "0.03"
+      SIMULATED_LATENCY_MS: "800"      # SWIFT is slow
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8092/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rail-adapter-alipay:
+    <<: *service-defaults
+    build:
+      context: ./services/rail-adapters/alipay
+      dockerfile: Dockerfile
+    container_name: grp-rail-alipay
+    ports:
+      - "8093:8093"
+    environment:
+      PORT: "8093"
+      KAFKA_BROKERS: kafka:29092
+      RAIL_NAME: alipay
+      SIMULATED_FAILURE_RATE: "0.01"
+      SIMULATED_LATENCY_MS: "200"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8093/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rail-adapter-wechat:
+    <<: *service-defaults
+    build:
+      context: ./services/rail-adapters/wechat
+      dockerfile: Dockerfile
+    container_name: grp-rail-wechat
+    ports:
+      - "8094:8094"
+    environment:
+      PORT: "8094"
+      KAFKA_BROKERS: kafka:29092
+      RAIL_NAME: wechat
+      SIMULATED_FAILURE_RATE: "0.01"
+      SIMULATED_LATENCY_MS: "180"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8094/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rail-adapter-jcb:
+    <<: *service-defaults
+    build:
+      context: ./services/rail-adapters/jcb
+      dockerfile: Dockerfile
+    container_name: grp-rail-jcb
+    ports:
+      - "8095:8095"
+    environment:
+      PORT: "8095"
+      KAFKA_BROKERS: kafka:29092
+      RAIL_NAME: jcb
+      SIMULATED_FAILURE_RATE: "0.02"
+      SIMULATED_LATENCY_MS: "150"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8095/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ── Volumes ────────────────────────────────────────────────────────────────────
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
+
+# ── Network ────────────────────────────────────────────────────────────────────
+
+networks:
+  globalroute:
+    driver: bridge
