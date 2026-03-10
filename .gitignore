@@ -1,0 +1,64 @@
+# Binaries
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build artifacts
+*.o
+*.a
+*.test
+coverage.out
+coverage.html
+
+# Go workspace
+go.work.sum
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+secrets/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*.DS_Store
+
+# Kubernetes & Helm
+kubeconfig
+*.kubeconfig
+helm/charts/*.tgz
+
+# Terraform (if used for GKE/EKS infra)
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!*.tfvars.example
+
+# Docker
+docker-compose.override.yml
+
+# Logs & profiling
+*.log
+*.prof
+pprof/
+
+# Kafka / local dev data
+data/
+kafka-logs/
+zookeeper-data/
+
+# Prometheus / Grafana local storage
+prometheus_data/
+grafana_data/
